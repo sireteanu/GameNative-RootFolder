@@ -65,7 +65,7 @@ android {
     }
 
     defaultConfig {
-        applicationId = "app.gamenative"
+        applicationId = "app.gamenative.rootfolder"
 
         minSdk = 26
 

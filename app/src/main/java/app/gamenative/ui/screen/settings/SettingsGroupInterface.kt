@@ -718,7 +718,7 @@ fun SettingsGroupInterface(
                 }
             },
         )
-        if (useExternalStorage) {
+        if (useExternalStorage && dirs.isNotEmpty()) {
             // Currently selected item
             var selectedIndex by rememberSaveable(dirs) {
                 mutableStateOf(
@@ -739,6 +739,7 @@ fun SettingsGroupInterface(
                 colors = settingsTileColorsAlt(),
             )
         }
+        CustomInstallFolderSetting() // GameNative-RootFolder
         // Steam download server selection
         SettingsMenuLink(
             colors = settingsTileColorsAlt(),

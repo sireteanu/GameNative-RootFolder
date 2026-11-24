@@ -1,0 +1,136 @@
+# GameNative-RootFolder: rebuilds the fork on top of the latest upstream GameNative.
+#
+# The fork's own commits (on this repo's master) are rebased onto upstream/master inside the
+# runner only, so nothing is pushed back and no PAT is needed. A release is published for each
+# new upstream commit. If the fork's commits stop applying cleanly, the run fails and GitHub
+# emails the repo owner.
+#
+# Required secret: DEBUG_KEYSTORE_B64 (base64 of a keystore with alias androiddebugkey,
+# store/key password "android"). Keeping it fixed means each APK installs over the last one.
+
+name: RootFolder build
+
+on:
+  schedule:
+    - cron: "17 9 * * *" # daily
+  push:
+    branches: ["master"]
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Build even if this upstream commit was already released"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: rootfolder-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.repository != 'utkarshdalal/GameNative'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+
+      - name: Rebase fork commits onto latest upstream
+        id: rebase
+        run: |
+          git config user.name "rootfolder-bot"
+          git config user.email "rootfolder-bot@users.noreply.github.com"
+          git remote add upstream https://github.com/utkarshdalal/GameNative.git
+          git fetch --no-tags upstream master
+          BASE=$(git merge-base HEAD upstream/master)
+          echo "Fork commits:"; git log --oneline "$BASE"..HEAD
+          git rebase upstream/master
+          UP=$(git rev-parse --short=7 upstream/master)
+          echo "upstream=$UP" >> "$GITHUB_OUTPUT"
+          echo "tag=rootfolder-$(date -u +%Y%m%d)-$UP" >> "$GITHUB_OUTPUT"
+
+      - name: Skip if this upstream commit is already released
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          UP="${{ steps.rebase.outputs.upstream }}"
+          if [ "${{ github.event_name }}" != "push" ] && [ "${{ inputs.force }}" != "true" ] && \
+             gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName -q '.[].tagName' | grep -q -- "-$UP"; then
+            echo "Already built upstream $UP; skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Free disk space
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift
+          sudo fallocate -l 8G /mnt/swapfile.ci && sudo chmod 600 /mnt/swapfile.ci
+          sudo mkswap /mnt/swapfile.ci && sudo swapon /mnt/swapfile.ci
+          df -h / && free -m
+
+      - name: Check out leveldb + snappy submodules
+        if: steps.check.outputs.skip != 'true'
+        run: git submodule update --init --recursive iq80-leveldb/upstream snappy-java/upstream
+
+      - uses: actions/setup-java@v4
+        if: steps.check.outputs.skip != 'true'
+        with:
+          java-version: "17"
+          distribution: "temurin"
+
+      - uses: gradle/actions/setup-gradle@v4
+        if: steps.check.outputs.skip != 'true'
+
+      - name: Install signing key
+        if: steps.check.outputs.skip != 'true'
+        env:
+          DEBUG_KEYSTORE_B64: ${{ secrets.DEBUG_KEYSTORE_B64 }}
+        run: |
+          if [ -z "$DEBUG_KEYSTORE_B64" ]; then
+            echo "::error::Secret DEBUG_KEYSTORE_B64 is missing; APKs would get a random key and not update each other."
+            exit 1
+          fi
+          mkdir -p ~/.android
+          echo "$DEBUG_KEYSTORE_B64" | base64 --decode > ~/.android/debug.keystore
+
+      - name: Build legacy release APK
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          touch local.properties
+          # log memory/disk in the background so a runner crash is diagnosable
+          ( while true; do echo "[mon] $(free -m | awk '/Mem/{print "mem used " $3 "MB"}') $(df -h / | awk 'NR==2{print "disk free " $4}')"; sleep 60; done ) &
+          # same path upstream uses: bundle, then a universal APK via bundletool
+          ./gradlew --max-workers=2 -Pkotlin.daemon.jvmargs=-Xmx4g :app:bundleLegacyRelease
+          ./gradlew --stop
+          java -Xmx3g -jar tools/bundletool-all-1.17.2.jar build-apks \
+            --bundle=app/build/outputs/bundle/legacyRelease/app-legacy-release.aab \
+            --output=app.apks --mode=universal \
+            --ks="$HOME/.android/debug.keystore" --ks-key-alias=androiddebugkey \
+            --ks-pass=pass:android --key-pass=pass:android
+          mkdir -p out
+          unzip -p app.apks universal.apk > "out/GameNative-RootFolder-${{ steps.rebase.outputs.upstream }}.apk"
+          ls -la out
+
+      - name: Publish release
+        if: steps.check.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.rebase.outputs.tag }}"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            TAG="$TAG-${{ github.run_number }}"
+          fi
+          NOTES="Built from upstream utkarshdalal/GameNative@${{ steps.rebase.outputs.upstream }} plus the RootFolder changes.
+
+          Fork changes:
+          $(git log --format='- %s' upstream/master..HEAD)"
+          gh release create "$TAG" out/*.apk --repo "$GITHUB_REPOSITORY" --target master --title "$TAG" --notes "$NOTES" --latest
